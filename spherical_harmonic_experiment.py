@@ -13,6 +13,123 @@ from scipy.integrate import simpson
 from scipy.optimize import minimize
 
 
+def calc_l2_inner_product_on_sphere(
+        f: np.ndarray,
+        g: np.ndarray,
+        points: np.ndarray,
+) -> float:
+    """
+    Compute L2 inner product on sphere surface: <f, g> = ∫∫ f(θ,φ) g(θ,φ) sin(φ) dφ dθ.
+
+    Parameters
+    ----------
+    f : np.ndarray, shape (N,)
+        First function values evaluated at points.
+    g : np.ndarray, shape (N,)
+        Second function values evaluated at points.
+    points : np.ndarray, shape (N, 2)
+        Points on sphere, columns [theta, phi]. Assumed to lie on a tensor grid
+        with n_phi unique phi values and n_theta unique theta values.
+
+    Returns
+    -------
+    float
+        Inner product <f, g>.
+    """
+    if f.shape != g.shape or points.shape[0] != f.shape[0]:
+        raise ValueError("Shapes of f, g, and points are inconsistent.")
+
+    theta = points[:, 0]
+    phi = points[:, 1]
+
+    # Recover grid sizes (assumes tensor product grid)
+    theta_vals = np.unique(theta)
+    phi_vals = np.unique(phi)
+    n_theta = theta_vals.size
+    n_phi = phi_vals.size
+
+    if n_theta * n_phi != points.shape[0]:
+        raise ValueError("Points are not on a regular tensor grid (phi, theta).")
+
+    # Reshape to (n_phi, n_theta) grid
+    f_grid = f.reshape(n_phi, n_theta)
+    g_grid = g.reshape(n_phi, n_theta)
+    phi_grid = phi.reshape(n_phi, n_theta)
+
+    # Integrand: f * g * sin(phi)
+    integrand = f_grid * g_grid * np.sin(phi_grid)
+
+    # Integrate over phi (axis=0), then over theta
+    # phi_vals and theta_vals must be sorted; np.unique returns sorted arrays.
+    tmp = simpson(integrand, x=phi_vals, axis=0)  # shape (n_theta,)
+    inner_product = simpson(tmp, x=theta_vals)  # scalar
+
+    # Clip tiny negative values due to roundoff (for squared norms)
+    if inner_product < 0:
+        if inner_product > -1e-12 * abs(inner_product):
+            inner_product = 0.0
+
+    return float(inner_product)
+
+
+def calc_gram_matrix_on_sphere(
+        basis_functions,
+        domain_phi: Tuple[float, float],
+        n_quad: int = 1000,
+):
+    """
+    Calculate Gram matrix on sphere surface for given basis functions.
+
+    The Gram matrix G[i,j] = <phi_i, phi_j>_domain, where the inner product
+    is computed over the spherical region with surface element sin(phi) dphi dtheta.
+
+    Parameters
+    ----------
+    basis_functions : list of callables
+        Each basis function takes an array of points of shape (N, 2) with
+        columns (theta, phi), and returns an array of length N.
+    domain_phi : (float, float)
+        Phi range for the domain: (start_phi, end_phi).
+    n_quad : int
+        Number of quadrature points in each angular direction.
+
+    Returns
+    -------
+    np.ndarray, shape (d, d)
+        Gram matrix G where G[i,j] = <phi_i, phi_j>_domain.
+    """
+    phi_start, phi_end = domain_phi
+
+    # 1D quadrature points
+    theta_points = np.linspace(0.0, 2.0 * np.pi, n_quad)
+    phi_points = np.linspace(phi_start, phi_end, n_quad)
+
+    # 2D grids: shape (n_quad, n_quad), rows = phi, cols = theta
+    theta_grid, phi_grid = np.meshgrid(theta_points, phi_points)
+
+    # Flattened points for evaluation: (theta, phi)
+    points = np.column_stack([theta_grid.ravel(), phi_grid.ravel()])
+
+    d = len(basis_functions)
+
+    # Precompute basis values on the grid for efficiency
+    Phi = np.empty((d, n_quad, n_quad))
+    for k, bf in enumerate(basis_functions):
+        Phi[k] = bf(points).reshape(n_quad, n_quad)
+
+    # Calculate Gram matrix G[i,j] = <phi_i, phi_j>_domain using inner product function
+    G = np.empty((d, d))
+    for i in range(d):
+        for j in range(i, d):
+            # Flatten the grids to vectors for inner product calculation
+            phi_i_flat = Phi[i].ravel()
+            phi_j_flat = Phi[j].ravel()
+            G[i, j] = calc_l2_inner_product_on_sphere(phi_i_flat, phi_j_flat, points)
+            G[j, i] = G[i, j]  # Symmetric matrix
+
+    return G
+
+
 # Spherical harmonics functions
 def real_spherical_harmonics(x: np.ndarray, l: int, m: int):
     """Compute real spherical harmonics Y_l^m."""
@@ -427,7 +544,7 @@ def test_ls_and_lasso_with_given_coefs(coefs: np.ndarray,
     # Add noise if requested
     if add_noise:
         # Calculate noise level from SNR
-        signal_power = np.var(y_train_true)
+        signal_power = np.mean(y_train_true ** 2)
         noise_power = signal_power / (10 ** (snr / 10))
         noise = np.random.normal(0, np.sqrt(noise_power), y_train_true.shape)
         y_train = y_train_true + noise
@@ -622,7 +739,8 @@ def main():
     num_input_points_list = [30, 50, 100, 200, 500, 1000, 2000, 5000]  # List of input points to test
     add_noise = True
     snr = 30.0
-    random_seed = 42  # Random seed for reproducibility
+    random_seed = 42  # Base random seed for reproducibility
+    num_seeds = 10
     
     # Use fixed coefficients: 1 * ones
     coefs = 1 * np.ones(deg)
@@ -631,6 +749,8 @@ def main():
     input_points_results = []
     ls_errors = []
     projected_errors = []
+    ls_errors_std = []
+    projected_errors_std = []
     lower_bounds = []
     upper_bounds = []
     error_improvements = []
@@ -638,116 +758,141 @@ def main():
     print("=" * 80)
     print(f"Testing with {method.upper()} and coefficients: {coefs}")
     print(f"Testing with input points: {num_input_points_list}")
+    print(f"Testing with seeds: {[random_seed + i for i in range(num_seeds)]}")
     print("=" * 80)
     
     # Loop over different numbers of input points
     for num_input_points in num_input_points_list:
-        # Set random seed for reproducibility (same seed for each run)
-        np.random.seed(random_seed)
-        
         print(f"\n{'=' * 80}")
         print(f"Running with num_input_points = {num_input_points}")
         print(f"{'=' * 80}")
-        
-        # Run test
-        results = test_ls_and_lasso_with_given_coefs(
-            coefs=coefs,
-            deg=deg,
-            method=method,
-            lasso_alpha=lasso_alpha,
-            omega_size=omega_size,
-            num_input_points=num_input_points,
-            add_noise=add_noise,
-            snr=snr
-        )
-        
-        # Check if method is in feasible space
-        method_key = results['method']
-        method_proj_key = f'{method_key}_proj'
-        Xi_err_anchor_vs_fit = results['metrics'][method_key]['Xi_err_anchor_vs_fit']
-        radius = results['radius']
-        in_feasible = Xi_err_anchor_vs_fit <= radius ** 0.5
-        
-        # Get metrics for original method
-        true_min = results.get('true_min', None)
-        true_max = results.get('true_max', None)
-        anchor_constant = results.get('anchor_constant', None)
-        xi_size = results.get('xi_size', None)
-        Xi_err = results['metrics'][method_key]['Xi_err']
-        Xi_err_anchor_vs_true = results['metrics']['True']['Xi_err_anchor_vs_true']
-        
-        # Get metrics for projected method
-        Xi_err_proj = results['metrics'][method_proj_key]['Xi_err']
-        Xi_err_anchor_vs_proj = results['metrics'][method_proj_key]['Xi_err_anchor_vs_fit']
-        in_feasible_proj = Xi_err_anchor_vs_proj <= radius ** 0.5
-        
-        # Calculate distance between prediction and projection (upper bound)
-        y_ext_pred = results['y_ext_pred']
-        y_ext_proj = results['y_ext_proj']
-        extrapolation_points = results['extrapolation_points']
-        delta = calc_l2_error_on_sphere(y_ext_pred, y_ext_proj, extrapolation_points) ** 0.5
-        upper_bound = delta
-        # radius is L2, therefore we need to sqrt it
-        lower_bound = delta * (delta / (delta + (radius ** 0.5))) ** 0.5
-        
-        # Calculate error improvement
-        error_improvement = Xi_err - Xi_err_proj
-        
+
+        per_seed_ls_errors = []
+        per_seed_projected_errors = []
+        per_seed_lower_bounds = []
+        per_seed_upper_bounds = []
+        per_seed_error_improvements = []
+
+        for seed_idx in range(num_seeds):
+            current_seed = random_seed + seed_idx
+            np.random.seed(current_seed)
+            print(f"  Seed {current_seed}...")
+
+            # Run test
+            results = test_ls_and_lasso_with_given_coefs(
+                coefs=coefs,
+                deg=deg,
+                method=method,
+                lasso_alpha=lasso_alpha,
+                omega_size=omega_size,
+                num_input_points=num_input_points,
+                add_noise=add_noise,
+                snr=snr
+            )
+
+            # Check if method is in feasible space
+            method_key = results['method']
+            method_proj_key = f'{method_key}_proj'
+            Xi_err_anchor_vs_fit = results['metrics'][method_key]['Xi_err_anchor_vs_fit']
+            radius = results['radius']
+            in_feasible = Xi_err_anchor_vs_fit <= radius ** 0.5
+
+            # Get metrics for original method
+            true_min = results.get('true_min', None)
+            true_max = results.get('true_max', None)
+            anchor_constant = results.get('anchor_constant', None)
+            xi_size = results.get('xi_size', None)
+            Xi_err = results['metrics'][method_key]['Xi_err']
+            Xi_err_anchor_vs_true = results['metrics']['True']['Xi_err_anchor_vs_true']
+
+            # Get metrics for projected method
+            Xi_err_proj = results['metrics'][method_proj_key]['Xi_err']
+            Xi_err_anchor_vs_proj = results['metrics'][method_proj_key]['Xi_err_anchor_vs_fit']
+            in_feasible_proj = Xi_err_anchor_vs_proj <= radius ** 0.5
+
+            # Calculate distance between prediction and projection (upper bound)
+            y_ext_pred = results['y_ext_pred']
+            y_ext_proj = results['y_ext_proj']
+            extrapolation_points = results['extrapolation_points']
+            delta = calc_l2_error_on_sphere(y_ext_pred, y_ext_proj, extrapolation_points) ** 0.5
+            upper_bound = delta
+            # radius is L2, therefore we need to sqrt it
+            lower_bound = delta * (delta / (delta + (radius ** 0.5))) ** 0.5
+
+            # Calculate error improvement
+            error_improvement = Xi_err - Xi_err_proj
+
+            per_seed_ls_errors.append(Xi_err)
+            per_seed_projected_errors.append(Xi_err_proj)
+            per_seed_lower_bounds.append(lower_bound)
+            per_seed_upper_bounds.append(upper_bound)
+            per_seed_error_improvements.append(error_improvement)
+
+            # Print metrics
+            print(f"\n{'*' * 80}")
+            print(f"Results - {method_key} (num_input_points={num_input_points}, seed={current_seed})")
+            print(f"{'*' * 80}")
+            print(f"1. Anchor radius: {radius ** 0.5:.6e}")
+            print(f"2. Xi_size: {xi_size:.6e}")
+            print(f"3. True value range: min={true_min:.6f}, max={true_max:.6f}, anchor_constant={anchor_constant:.6f}")
+            print(f"4. {method_key} error from true (Xi_err): {Xi_err:.6e}")
+            print(f"5. {method_key} error from anchor (Xi_err_anchor_vs_fit): {Xi_err_anchor_vs_fit:.6e}")
+            print(f"6. In feasible space: {in_feasible}")
+            print(f"\n{'*' * 80}")
+            print(f"Results - {method_proj_key} (Projected) (num_input_points={num_input_points}, seed={current_seed})")
+            print(f"{'*' * 80}")
+            print(f"1. Anchor radius: {radius ** 0.5:.6e}")
+            print(f"2. Xi_size: {xi_size:.6e}")
+            print(f"3. True value range: min={true_min:.6f}, max={true_max:.6f}, anchor_constant={anchor_constant:.6f}")
+            print(f"4. {method_proj_key} error from true (Xi_err): {Xi_err_proj:.6e}")
+            print(f"5. {method_proj_key} error from anchor (Xi_err_anchor_vs_fit): {Xi_err_anchor_vs_proj:.6e}")
+            print(f"6. In feasible space: {in_feasible_proj}")
+            print(f"\n{'*' * 80}")
+            print(f"Comparison (num_input_points={num_input_points}, seed={current_seed}):")
+            print(f"{'*' * 80}")
+            print(f"Regular {method_key} error from true: {Xi_err:.6e}")
+            print(f"Projected {method_proj_key} error from true: {Xi_err_proj:.6e}")
+            print(f"Error improvement: {Xi_err - Xi_err_proj:.6e} ({((Xi_err - Xi_err_proj) / Xi_err * 100):.2f}% reduction)")
+            print(f"\nError to anchor function:")
+            print(f"  Anchor function error to true function: {Xi_err_anchor_vs_true:.6e}")
+            print(f"  Regular {method_key} error from anchor: {Xi_err_anchor_vs_fit:.6e}")
+            print(f"  Projected {method_proj_key} error from anchor: {Xi_err_anchor_vs_proj:.6e}")
+            print(f"  Anchor radius (feasible space bound): r={radius ** 0.5:.6e}")
+            print(f"  Regular {method_key} within feasible space: {in_feasible} (error {'<=' if in_feasible else '>'} radius)")
+            print(f"  Projected {method_proj_key} within feasible space: {in_feasible_proj} (error {'<=' if in_feasible_proj else '>'} radius)")
+            print(f"\nBounds:")
+            print(f"Upper bound (distance between prediction and projection): {upper_bound:.6e}")
+            print(f"Lower bound: {lower_bound:.6e}")
+            print(f"{'*' * 80}")
+
+        ls_error_mean = np.mean(per_seed_ls_errors)
+        ls_error_std = np.std(per_seed_ls_errors)
+        projected_error_mean = np.mean(per_seed_projected_errors)
+        projected_error_std = np.std(per_seed_projected_errors)
+        lower_bound_mean = np.mean(per_seed_lower_bounds)
+        upper_bound_mean = np.mean(per_seed_upper_bounds)
+        error_improvement_mean = np.mean(per_seed_error_improvements)
+
         # Clear summary print
         print(f"\n{'=' * 80}")
-        print(f"SUMMARY (num_input_points={num_input_points}):")
+        print(f"SUMMARY (num_input_points={num_input_points}, averaged over {num_seeds} seeds):")
         print(f"{'=' * 80}")
-        print(f"LS error:           {Xi_err:.6e}")
-        print(f"Projection error:   {Xi_err_proj:.6e}")
-        print(f"Lower bound:        {lower_bound:.6e}")
-        print(f"Error improvement:  {error_improvement:.6e}")
-        print(f"Upper bound:        {upper_bound:.6e}")
+        print(f"{method.upper()} error:        {ls_error_mean:.6e} ± {ls_error_std:.6e}")
+        print(f"Projection error:   {projected_error_mean:.6e} ± {projected_error_std:.6e}")
+        print(f"Lower bound mean:   {lower_bound_mean:.6e}")
+        print(f"Error improvement:  {error_improvement_mean:.6e}")
+        print(f"Upper bound mean:   {upper_bound_mean:.6e}")
         print(f"{'=' * 80}\n")
-        
-        # Store errors for plotting
+
+        # Store mean/std errors for plotting
         input_points_results.append(num_input_points)
-        ls_errors.append(Xi_err)
-        projected_errors.append(Xi_err_proj)
-        lower_bounds.append(lower_bound)
-        upper_bounds.append(upper_bound)
-        error_improvements.append(error_improvement)
-        
-        # Print metrics
-        print(f"\n{'*' * 80}")
-        print(f"Results - {method_key} (num_input_points={num_input_points})")
-        print(f"{'*' * 80}")
-        print(f"1. Anchor radius: {radius ** 0.5:.6e}")
-        print(f"2. Xi_size: {xi_size:.6e}")
-        print(f"3. True value range: min={true_min:.6f}, max={true_max:.6f}, anchor_constant={anchor_constant:.6f}")
-        print(f"4. {method_key} error from true (Xi_err): {Xi_err:.6e}")
-        print(f"5. {method_key} error from anchor (Xi_err_anchor_vs_fit): {Xi_err_anchor_vs_fit:.6e}")
-        print(f"6. In feasible space: {in_feasible}")
-        print(f"\n{'*' * 80}")
-        print(f"Results - {method_proj_key} (Projected) (num_input_points={num_input_points})")
-        print(f"{'*' * 80}")
-        print(f"1. Anchor radius: {radius ** 0.5:.6e}")
-        print(f"2. Xi_size: {xi_size:.6e}")
-        print(f"3. True value range: min={true_min:.6f}, max={true_max:.6f}, anchor_constant={anchor_constant:.6f}")
-        print(f"4. {method_proj_key} error from true (Xi_err): {Xi_err_proj:.6e}")
-        print(f"5. {method_proj_key} error from anchor (Xi_err_anchor_vs_fit): {Xi_err_anchor_vs_proj:.6e}")
-        print(f"6. In feasible space: {in_feasible_proj}")
-        print(f"\n{'*' * 80}")
-        print(f"Comparison (num_input_points={num_input_points}):")
-        print(f"{'*' * 80}")
-        print(f"Regular {method_key} error from true: {Xi_err:.6e}")
-        print(f"Projected {method_proj_key} error from true: {Xi_err_proj:.6e}")
-        print(f"Error improvement: {Xi_err - Xi_err_proj:.6e} ({((Xi_err - Xi_err_proj) / Xi_err * 100):.2f}% reduction)")
-        print(f"\nError to anchor function:")
-        print(f"  Anchor function error to true function: {Xi_err_anchor_vs_true:.6e}")
-        print(f"  Regular {method_key} error from anchor: {Xi_err_anchor_vs_fit:.6e}")
-        print(f"  Projected {method_proj_key} error from anchor: {Xi_err_anchor_vs_proj:.6e}")
-        print(f"  Anchor radius (feasible space bound): r={radius ** 0.5:.6e}")
-        print(f"  Regular {method_key} within feasible space: {in_feasible} (error {'<=' if in_feasible else '>'} radius)")
-        print(f"  Projected {method_proj_key} within feasible space: {in_feasible_proj} (error {'<=' if in_feasible_proj else '>'} radius)")
-        print(f"\nBounds:")
-        print(f"Upper bound (distance between prediction and projection): {upper_bound:.6e}")
-        print(f"Lower bound: {lower_bound:.6e}")
-        print(f"{'*' * 80}")
+        ls_errors.append(ls_error_mean)
+        projected_errors.append(projected_error_mean)
+        ls_errors_std.append(ls_error_std)
+        projected_errors_std.append(projected_error_std)
+        lower_bounds.append(lower_bound_mean)
+        upper_bounds.append(upper_bound_mean)
+        error_improvements.append(error_improvement_mean)
     
     # Create comparison plot
     print("\n" + "=" * 80)
@@ -763,6 +908,18 @@ def main():
     
     ax.plot(input_points_results, ls_errors, 'o-', label=f'{method.upper()}', linewidth=2, markersize=8)
     ax.plot(input_points_results, projected_errors, 's-', label='Projected', linewidth=2, markersize=8)
+    ax.fill_between(
+        input_points_results,
+        np.array(ls_errors) - np.array(ls_errors_std),
+        np.array(ls_errors) + np.array(ls_errors_std),
+        alpha=0.2
+    )
+    ax.fill_between(
+        input_points_results,
+        np.array(projected_errors) - np.array(projected_errors_std),
+        np.array(projected_errors) + np.array(projected_errors_std),
+        alpha=0.2
+    )
     
     ax.set_xlabel('Number of Input Points', fontsize=tick_size)
     ax.set_ylabel('Error from True Function', fontsize=tick_size)
@@ -786,8 +943,8 @@ def main():
     print(f"{'=' * 80}")
     for i, num_points in enumerate(input_points_results):
         print(f"\nnum_input_points={num_points}:")
-        print(f"  LS error:           {ls_errors[i]:.6e}")
-        print(f"  Projection error:   {projected_errors[i]:.6e}")
+        print(f"  {method.upper()} error:        {ls_errors[i]:.6e} ± {ls_errors_std[i]:.6e}")
+        print(f"  Projection error:   {projected_errors[i]:.6e} ± {projected_errors_std[i]:.6e}")
         print(f"  Lower bound:        {lower_bounds[i]:.6e}")
         print(f"  Error improvement:  {error_improvements[i]:.6e}")
         print(f"  Upper bound:        {upper_bounds[i]:.6e}")
